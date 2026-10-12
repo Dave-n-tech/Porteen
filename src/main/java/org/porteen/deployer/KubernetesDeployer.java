@@ -13,9 +13,10 @@ import io.kubernetes.client.openapi.models.*;
 import io.kubernetes.client.util.Config;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
+import java.util.Set;
 
 public class KubernetesDeployer {
 
@@ -23,6 +24,12 @@ public class KubernetesDeployer {
     private final AppsV1Api appsApi;
     private final NetworkingV1Api networkingApi;
     private final String baseDomain;
+
+    private static final Duration POLL_INTERVAL = Duration.ofSeconds(2);
+
+    private static final Set<String> FATAL_WAITING_REASONS = Set.of(
+            "ErrImagePull", "ImagePullBackOff", "InvalidImageName",
+            "CrashLoopBackOff", "CreateContainerConfigError");
 
     public KubernetesDeployer(String baseDomain) throws IOException {
         ApiClient client = Config.defaultClient();
@@ -38,7 +45,74 @@ public class KubernetesDeployer {
         void run() throws ApiException;
     }
 
-    public DeployResult deploy(DeploySpec spec) throws ApiException {
+    private record RolloutOutcome(boolean ok, String message) {}
+
+    private RolloutOutcome awaitRollout(String namespace, String name, Duration timeout)
+            throws ApiException, InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+
+        while (System.nanoTime() < deadline) {
+            V1Deployment d = appsApi.readNamespacedDeployment(name, namespace).execute();
+
+            if(isRolloutComplete(d)) {
+                return new RolloutOutcome(true, "Rollout complete");
+            }
+
+            String podProblem = findPodProblem(namespace, name);
+            if (podProblem != null) {
+                return new RolloutOutcome(false, podProblem);
+            }
+
+            Thread.sleep(POLL_INTERVAL.toMillis());
+        }
+        return new RolloutOutcome(false, "timed out after " + timeout.toSeconds() + "s waiting for rollout");
+    }
+
+    private boolean isRolloutComplete(V1Deployment d) {
+        V1DeploymentStatus s = d.getStatus();
+        if (s == null) return false;
+
+        long generation = d.getMetadata().getGeneration();
+        long observed = s.getObservedGeneration() == null ? 0 : s.getObservedGeneration();
+        int desired = d.getSpec().getReplicas();
+        int updated = orZero(s.getUpdatedReplicas());
+        int total = orZero(s.getReplicas());
+        int available = orZero(s.getAvailableReplicas());
+
+        return observed >= generation   // the controller has seen our latest change
+                && updated == desired   // all pods run the new spec
+                && total == updated     // no old pods left
+                && available == updated; // all are passing readiness
+    }
+
+    private String findPodProblem(String namespace, String appName) throws ApiException {
+        V1PodList pods = coreApi.listNamespacedPod(namespace)
+                .labelSelector("app=" + appName)
+                .execute();
+
+        for (V1Pod pod : pods.getItems()) {
+            if (pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) continue;
+            for (V1ContainerStatus cs : pod.getStatus().getContainerStatuses()) {
+                V1ContainerStateWaiting waiting =
+                        cs.getState() == null ? null : cs.getState().getWaiting();
+                if (waiting != null && FATAL_WAITING_REASONS.contains(waiting.getReason())) {
+                    return pod.getMetadata().getName() + ": " + waiting.getReason()
+                            + (waiting.getMessage() == null ? "" : " - " + waiting.getMessage());
+                }
+            }
+        }
+        return null;
+    }
+
+    private static int orZero(Integer v) {
+        return v == null ? 0 : v;
+    }
+
+    public DeployResult deploy(DeploySpec spec) throws ApiException, InterruptedException{
+        return deploy(spec, Duration.ofSeconds(120));
+    }
+
+    public DeployResult deploy(DeploySpec spec, Duration timeout) throws ApiException, InterruptedException {
         String namespace = "tenant-" + spec.tenant();
         String hostname = generateHostname(spec.tenant(), spec.appName());
         Map<String, String> labels = Map.of("app", spec.appName());
@@ -48,7 +122,9 @@ public class KubernetesDeployer {
         createService(namespace, spec, labels);
         createIngress(namespace, spec, hostname);
 
-        return new DeployResult(namespace, hostname);
+        RolloutOutcome outcome = awaitRollout(namespace, spec.appName(), timeout);
+        return new DeployResult(namespace, hostname,
+                outcome.ok() ? DeployStatus.LIVE : DeployStatus.FAILED, outcome.message());
     }
 
     private void ensureNamespace(String name) throws ApiException {
